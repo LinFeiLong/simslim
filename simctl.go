@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -351,12 +352,38 @@ func Shutdown(ctx context.Context, set, udid string) error {
 // readDisabled returns the labels currently disabled in the device's system
 // domain. A label absent from the output is enabled.
 func readDisabled(ctx context.Context, set, udid string) (map[string]bool, error) {
-	out, err := exec.CommandContext(ctx, "xcrun", simctlArgs(set, "spawn", udid,
-		"launchctl", "print-disabled", "system")...).CombinedOutput()
+	out, err := readLaunchd(ctx, set, udid, "print-disabled", "system")
 	if err != nil {
-		return nil, fmt.Errorf("launchctl print-disabled: %w: %s", err, strings.TrimSpace(string(out)))
+		return nil, err
 	}
 	return parseDisabled(string(out)), nil
+}
+
+// launchdRetryDelays are the pauses between attempts to read a simulator's
+// launchd state. Right after a boot, and while a reboot tears the old boot
+// session down, launchd_sim refuses spawns for a few seconds
+// (LaunchdSimError 124, "Domain is tearing down"); a read that fails then is
+// retried rather than failing the whole command. A var so tests can shorten it.
+var launchdRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+// readLaunchd runs a read-only launchctl command inside the simulator,
+// retrying a failure after each of launchdRetryDelays.
+func readLaunchd(ctx context.Context, set, udid string, args ...string) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		out, err := exec.CommandContext(ctx, "xcrun", simctlArgs(set, append([]string{"spawn", udid, "launchctl"}, args...)...)...).CombinedOutput()
+		if err == nil {
+			return out, nil
+		}
+		err = fmt.Errorf("launchctl %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
+		if attempt == len(launchdRetryDelays) || ctx.Err() != nil {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(launchdRetryDelays[attempt]):
+		}
+	}
 }
 
 // parseDisabled reads `launchctl print-disabled` lines. Recent launchd prints
@@ -466,6 +493,14 @@ func applyDelta(ctx context.Context, set, udid string, toDisable, toEnable []str
 		if pass > 1 {
 			report.report(fmt.Sprintf("  retrying %d failed services (pass %d/%d)...",
 				len(pending), pass, applyPasses))
+			// Give a launchd that refused the spawns (still starting, or
+			// briefly unavailable) a moment before asking it again.
+			if n := len(launchdRetryDelays); n > 0 {
+				select {
+				case <-ctx.Done():
+				case <-time.After(launchdRetryDelays[min(pass-2, n-1)]):
+				}
+			}
 		}
 		type result struct {
 			t   transition
@@ -555,9 +590,21 @@ func runtimeRoot(ctx context.Context, runtimeID string) (string, error) {
 // what is missing label by label. A chunk that runs out of time ends the
 // batch, so a slow host keeps the rest of its budget for that per-label path.
 func unloadJobs(ctx context.Context, set, udid string, paths []string) {
+	batchJobs(ctx, set, udid, "unload", paths)
+}
+
+// loadJobs is the mirror of unloadJobs: one `launchctl load -w` per chunk lifts
+// each job's disable override and loads it into the running boot session, in
+// whichever domain its plist belongs to. launchctl exits 0 even when a job
+// fails to load, so the caller reads the state back here too.
+func loadJobs(ctx context.Context, set, udid string, paths []string) {
+	batchJobs(ctx, set, udid, "load", paths)
+}
+
+func batchJobs(ctx context.Context, set, udid, verb string, paths []string) {
 	for start := 0; start < len(paths); start += unloadChunk {
 		end := min(start+unloadChunk, len(paths))
-		args := simctlArgs(set, append([]string{"spawn", udid, "launchctl", "unload", "-w"}, paths[start:end]...)...)
+		args := simctlArgs(set, append([]string{"spawn", udid, "launchctl", verb, "-w"}, paths[start:end]...)...)
 		spawnCtx, cancel := context.WithTimeout(ctx, SpawnTimeout)
 		_ = exec.CommandContext(spawnCtx, "xcrun", args...).Run()
 		expired := spawnCtx.Err() != nil
@@ -568,11 +615,30 @@ func unloadJobs(ctx context.Context, set, udid string, paths []string) {
 	}
 }
 
+// bootstrapJobs loads each job into the running boot session with its own
+// `launchctl bootstrap`, for the few the batch load left behind. launchd
+// redirects the system domain to the one the job belongs in, as it does for
+// every per-label transition. The exit status is not trusted either (an
+// already-loaded job exits 37): the caller reads the state back.
+func bootstrapJobs(ctx context.Context, set, udid string, plists map[string]string) {
+	labels := make([]string, 0, len(plists))
+	for label := range plists {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	for _, label := range labels {
+		spawnCtx, cancel := context.WithTimeout(ctx, SpawnTimeout)
+		_ = exec.CommandContext(spawnCtx, "xcrun", simctlArgs(set, "spawn", udid,
+			"launchctl", "bootstrap", "system", plists[label])...).Run()
+		cancel()
+	}
+}
+
 // loadedLabels returns every label currently loaded in the simulator's launchd.
 func loadedLabels(ctx context.Context, set, udid string) (map[string]bool, error) {
-	out, err := exec.CommandContext(ctx, "xcrun", simctlArgs(set, "spawn", udid, "launchctl", "list")...).CombinedOutput()
+	out, err := readLaunchd(ctx, set, udid, "list")
 	if err != nil {
-		return nil, fmt.Errorf("launchctl list: %w: %s", err, strings.TrimSpace(string(out)))
+		return nil, err
 	}
 	return parseLaunchctlList(string(out)), nil
 }

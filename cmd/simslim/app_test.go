@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +133,42 @@ func TestAppFlagParsing(t *testing.T) {
 				t.Fatalf("Run(%v) error = %v, wantError %v", tt.args, err, tt.wantError)
 			}
 		})
+	}
+}
+
+// TestAppEnableDisableArguments covers the enable and disable argument checks,
+// which all fail before any simulator is looked up.
+func TestAppEnableDisableArguments(t *testing.T) {
+	const udid = "00000000-0000-0000-0000-0000000000A1"
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "enable without a UDID", args: []string{"enable"}, want: "expected a simulator UDID"},
+		{name: "enable without IDs", args: []string{"enable", udid}, want: "name at least one category ID"},
+		{name: "enable an unknown ID", args: []string{"enable", udid, "icloud,nope"}, want: `"nope"`},
+		{name: "disable without IDs", args: []string{"disable", udid}, want: "or pass --all"},
+		{name: "disable IDs and --all", args: []string{"disable", udid, "icloud", "--all"}, want: "not both"},
+		{name: "disable --all before IDs", args: []string{"disable", "--all", udid, "icloud"}, want: "not both"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PATH", t.TempDir()) // without xcrun, a lookup would fail differently
+			err := runApp(t, tt.args...)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Run(%v) error = %v, want %q", tt.args, err, tt.want)
+			}
+		})
+	}
+}
+
+// TestUDIDAndIDsSplitsCommaLists accepts IDs as separate arguments, as
+// comma-separated lists, or both, as in `simslim enable <udid> icloud,photos`.
+func TestUDIDAndIDsSplitsCommaLists(t *testing.T) {
+	udid, ids, err := udidAndIDs([]string{"U", "icloud,photos", "com.apple.cloudd"})
+	if err != nil || udid != "U" || !reflect.DeepEqual(ids, []string{"icloud", "photos", "com.apple.cloudd"}) {
+		t.Errorf("udidAndIDs = (%q, %v, %v), want U and [icloud photos com.apple.cloudd]", udid, ids, err)
 	}
 }
 

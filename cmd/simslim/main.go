@@ -235,7 +235,15 @@ func cmdStatus(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	st, disabled, err := simslim.ReadStatus(ctx, udid)
+	device, err := simslim.FindDevice(ctx, udid, "")
+	if err != nil {
+		return err
+	}
+	st, disabled, err := simslim.ReadStatusForDevice(ctx, device)
+	if err != nil {
+		return err
+	}
+	exceptions, err := simslim.ReadExceptions(device)
 	if err != nil {
 		return err
 	}
@@ -251,11 +259,18 @@ func cmdStatus(ctx context.Context, cmd *cli.Command) error {
 		dropped = simslim.DroppedCategories(disabled)
 	}
 	if jsonOutput {
-		return writeJSON(simslim.StatusOutput{Status: st, Verdict: verdict, Dropped: dropped})
+		out := simslim.StatusOutput{Status: st, Verdict: verdict, Dropped: dropped}
+		if !exceptions.IsEmpty() {
+			out.Exceptions = &exceptions
+		}
+		return writeJSON(out)
 	}
 	fmt.Printf("%s: %d/%d managed launchd labels disabled (%s)\n", udid, st.ManagedDisabled, st.ManagedTotal, verdict)
 	if st.ManagedDisabled > 0 && !st.Persistent {
 		fmt.Println("  This runtime cannot persist launchd overrides: the state reverts to stock at the next reboot.")
+	}
+	if !exceptions.IsEmpty() {
+		fmt.Printf("  Exceptions kept enabled by `simslim enable`: %s\n", exceptions)
 	}
 	if showDropped {
 		if len(dropped) == 0 {
@@ -300,6 +315,9 @@ func cmdVerify(ctx context.Context, cmd *cli.Command) error {
 			fmt.Printf("  extra   %s (disabled beyond the profile)\n", l)
 		}
 		fmt.Println("Re-run `simslim on` with the same profile to repair.")
+	}
+	if !jsonOutput && r.Exceptions != nil {
+		fmt.Printf("  The profile includes this simulator's exceptions: %s\n", r.Exceptions)
 	}
 	if !r.OK {
 		os.Exit(1)
@@ -765,19 +783,29 @@ func cmdOn(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// The simulator's own exceptions stay enabled whatever the profile says;
+	// the library merges them in, this only keeps the count honest.
+	exceptions, err := simslim.ReadExceptions(device)
+	if err != nil {
+		return err
+	}
+	services := len(p.WithExceptions(exceptions).DesiredForDevice(device))
 	report := simslim.Reporter(func(msg string) { fmt.Fprintln(os.Stderr, msg) })
 	tctx, cancel := context.WithTimeout(ctx, simslim.BootTimeout)
 	defer cancel()
 	if noReboot {
-		return onNoReboot(tctx, device, p, report)
+		return onNoReboot(tctx, device, p, services, report)
 	}
 	startedShutdown := device.State == "Shutdown"
 	originallyShutdown := preserveBootState && startedShutdown
 
 	if startedShutdown {
-		fmt.Fprintf(os.Stderr, "Slimming %s: disabling %d background services while it is off, then booting it slim.\n", udid, len(p.DesiredForDevice(device)))
+		fmt.Fprintf(os.Stderr, "Slimming %s: disabling %d background services while it is off, then booting it slim.\n", udid, services)
 	} else {
-		fmt.Fprintf(os.Stderr, "Slimming %s: disabling %d background services. The simulator will reboot to apply the changes.\n", udid, len(p.DesiredForDevice(device)))
+		fmt.Fprintf(os.Stderr, "Slimming %s: disabling %d background services. The simulator will reboot to apply the changes.\n", udid, services)
+	}
+	if !exceptions.IsEmpty() {
+		fmt.Fprintf(os.Stderr, "Keeping this simulator's exceptions enabled: %s\n", exceptions)
 	}
 	changed, operationErr := simslim.EnableSlim(tctx, device.Set, udid, p, report)
 	if originallyShutdown {
@@ -814,8 +842,8 @@ func cmdOn(ctx context.Context, cmd *cli.Command) error {
 // onNoReboot is `on --no-reboot`: stop the profile's daemons now, no reboot.
 // The closing line says what the next boot brings, since on iOS < 18.5 the
 // state is gone after a reboot and someone will otherwise report that as a bug.
-func onNoReboot(ctx context.Context, device simslim.Device, p simslim.Profile, report simslim.Reporter) error {
-	fmt.Fprintf(os.Stderr, "Slimming %s for this boot session: stopping %d background services without a reboot.\n", device.UDID, len(p.DesiredForDevice(device)))
+func onNoReboot(ctx context.Context, device simslim.Device, p simslim.Profile, services int, report simslim.Reporter) error {
+	fmt.Fprintf(os.Stderr, "Slimming %s for this boot session: stopping %d background services without a reboot.\n", device.UDID, services)
 	changed, err := simslim.EnableSlimNoReboot(ctx, device.Set, device.UDID, p, report)
 	if err != nil {
 		return err
@@ -898,6 +926,100 @@ func cmdOff(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 	return nil
+}
+
+// cmdEnable re-enables categories or daemons on one simulator without a reboot
+// and records them as its exceptions, which `on` and `watch` leave enabled.
+func cmdEnable(ctx context.Context, cmd *cli.Command) error {
+	jsonOutput := cmd.Bool("json")
+	udid, ids, err := udidAndIDs(cmd.Args().Slice())
+	if err != nil {
+		return err
+	}
+	tctx, cancel := context.WithTimeout(ctx, simslim.BootTimeout)
+	defer cancel()
+	out, err := simslim.EnableServices(tctx, udid, ids, progress(jsonOutput))
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(out)
+	}
+	if out.Live {
+		fmt.Printf("Enabled %d services on %s without a reboot.\n", len(out.Labels), udid)
+	} else {
+		fmt.Printf("Enabled %d services on %s; they start when it boots.\n", len(out.Labels), udid)
+	}
+	if len(out.NotStarted) > 0 {
+		fmt.Printf("  launchd starts %d of them at the next boot, not in this one: %s\n", len(out.NotStarted), strings.Join(out.NotStarted, ", "))
+	}
+	printExceptions(udid, out.Exceptions)
+	return nil
+}
+
+// cmdDisable is the inverse of enable: it stops categories or daemons now,
+// without a reboot, and drops them from the simulator's exceptions; --all
+// clears every exception, returning the simulator to its profile.
+func cmdDisable(ctx context.Context, cmd *cli.Command) error {
+	jsonOutput := cmd.Bool("json")
+	udid, ids, err := udidAndIDs(cmd.Args().Slice())
+	if err != nil {
+		return err
+	}
+	tctx, cancel := context.WithTimeout(ctx, simslim.BootTimeout)
+	defer cancel()
+	out, err := simslim.DisableServices(tctx, udid, ids, cmd.Bool("all"), progress(jsonOutput))
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(out)
+	}
+	switch {
+	case len(out.Labels) == 0:
+		fmt.Printf("Nothing to stop on %s.\n", udid)
+	case out.Live:
+		fmt.Printf("Stopped %d services on %s without a reboot.\n", len(out.Labels), udid)
+	default:
+		fmt.Printf("Disabled %d services on %s; they stay off when it boots.\n", len(out.Labels), udid)
+	}
+	if len(out.StillEnabled) > 0 {
+		fmt.Printf("  %d stay enabled for the simulator's other exceptions or its platform: %s\n", len(out.StillEnabled), strings.Join(out.StillEnabled, ", "))
+	}
+	printExceptions(udid, out.Exceptions)
+	return nil
+}
+
+// printExceptions closes enable and disable with what the simulator keeps.
+func printExceptions(udid string, exceptions simslim.Exceptions) {
+	if exceptions.IsEmpty() {
+		fmt.Println("No exceptions left: `on` and `watch` apply the profile alone to this simulator.")
+		return
+	}
+	fmt.Printf("Exceptions kept enabled through `on` and `watch`: %s. `simslim disable %s --all` clears them.\n", exceptions, udid)
+}
+
+// udidAndIDs reads `<udid> [ids...]`, where each ID argument may itself be a
+// comma-separated list, as in `simslim enable <udid> icloud,photos`. The
+// library says when the IDs are missing or clash with --all.
+func udidAndIDs(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, fmt.Errorf("expected a simulator UDID (see `simslim list`), then category IDs or launchd labels (see `simslim profiles`)")
+	}
+	var ids []string
+	for _, arg := range args[1:] {
+		ids = append(ids, simslim.SplitList(arg)...)
+	}
+	return args[0], ids, nil
+}
+
+// progress reports to stderr, except under --json, where consumers reading a
+// combined stream must get clean JSON.
+func progress(jsonOutput bool) simslim.Reporter {
+	if jsonOutput {
+		return nil
+	}
+	return func(msg string) { fmt.Fprintln(os.Stderr, msg) }
 }
 
 func returnToShutdown(ctx context.Context, set, udid string) error {
@@ -989,8 +1111,19 @@ COMMANDS
   off <udid>           Restore a simulator to stock (re-enable + reboot)
       --preserve-boot-state
                        Return an initially shutdown simulator to shutdown
-  watch                Slim every simulator no-reboot as it boots, until Ctrl-C.
-                       The hook for xcodebuild parallel-testing clones, which are
+  enable <udid> <ids>  Re-enable categories or individual daemons on one
+                       simulator now, without a reboot, and keep them as its
+                       exceptions: ` + "`on`" + `, ` + "`watch`" + `, and ` + "`verify`" + ` leave them
+                       enabled whatever the profile. IDs are category IDs or
+                       launchd labels, comma- or space-separated; a shutdown
+                       simulator gets them at its next boot
+  disable <udid> <ids> Stop categories or daemons now, without a reboot, and
+                       drop them from the simulator's exceptions
+      --all            Clear every exception and stop its daemons, returning
+                       the simulator to its profile
+  watch                Slim every simulator no-reboot as it boots, until Ctrl-C,
+                       leaving each simulator's exceptions running. The hook
+                       for xcodebuild parallel-testing clones, which are
                        created stock and deleted per run; point --set at the
                        parallel-testing device set
       --profile path   Apply a committed JSON profile (see below); mutually
@@ -998,7 +1131,8 @@ COMMANDS
       --except ids     Leave these categories enabled (comma-separated)
       --keep labels    Keep these individual daemons running (comma-separated)
       --interval dur   How often to rescan for booting simulators (default 3s)
-  status <udid>        Report how slim a booted simulator is
+  status <udid>        Report how slim a booted simulator is and the
+                       exceptions it keeps
       --dropped        Also list the disabled daemons grouped by category
   verify <udid>        Check that a booted simulator's disable overrides still
                        match a profile exactly; exits non-zero and lists the
@@ -1034,11 +1168,14 @@ COMMANDS
   erase <udid>         Erase a simulator's apps, data, and settings
   delete <udid>        Permanently delete a simulator
       --json           Print machine-readable JSON (also supported by list,
-                       profiles, status, and simulator-management commands)
+                       profiles, status, verify, doctor, enable, disable, and
+                       simulator-management commands)
   version              Print the version
 
 Disabling is persistent (stored in the simulator's launchd overrides) and fully
 reversible with ` + "`simslim off`" + `. Deadlock-prone daemons are never touched.
+` + "`simslim enable`" + ` brings one simulator's categories back live, and they stay
+with that simulator, like its overrides, until ` + "`simslim disable`" + ` takes them away.
 
 A ` + "`--profile`" + ` file is JSON you commit alongside your project and apply per run
 (for example a ci.json and a dev.json). Its "except" and "keep" arrays match the

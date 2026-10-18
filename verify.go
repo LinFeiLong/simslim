@@ -9,17 +9,20 @@ import (
 // VerifyResult reports how a booted simulator's launchd disable overrides
 // compare to a profile's desired set. Only managed labels are considered.
 type VerifyResult struct {
-	UDID    string   `json:"udid"`
-	OK      bool     `json:"ok"`
-	Missing []string `json:"missing,omitempty"` // profile wants these disabled; they are enabled
-	Extra   []string `json:"extra,omitempty"`   // managed labels disabled beyond the profile
+	UDID       string      `json:"udid"`
+	OK         bool        `json:"ok"`
+	Missing    []string    `json:"missing,omitempty"`    // profile wants these disabled; they are enabled
+	Extra      []string    `json:"extra,omitempty"`      // managed labels disabled beyond the profile
+	Exceptions *Exceptions `json:"exceptions,omitempty"` // the simulator's own exceptions, merged into the profile
 }
 
 // VerifyProfile checks, without mutating anything, that a booted simulator's
 // disable overrides match the profile exactly. The overrides are per-simulator
 // state that is easy to lose silently when a device is erased or recreated, so
 // VerifyProfile detects the drift and callers can re-run `on` (which is
-// idempotent) to repair it. SimSlim-created clones preserve this state.
+// idempotent) to repair it. SimSlim-created clones preserve this state. The
+// simulator's exceptions count as part of the profile, as `on` and `watch`
+// apply them.
 func VerifyProfile(ctx context.Context, udid string, p Profile) (VerifyResult, error) {
 	d, err := FindDevice(ctx, udid, "")
 	if err != nil {
@@ -28,12 +31,19 @@ func VerifyProfile(ctx context.Context, udid string, p Profile) (VerifyResult, e
 	if d.State != "Booted" {
 		return VerifyResult{}, fmt.Errorf("simulator must be booted to read its state (it is %s)", d.State)
 	}
+	exceptions, err := ReadExceptions(d)
+	if err != nil {
+		return VerifyResult{}, err
+	}
 	disabled, err := readDisabled(ctx, d.Set, d.UDID)
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	r := compareDisabled(disabled, p.DesiredForDevice(d), managedSet())
+	r := compareDisabled(disabled, exceptions.apply(p.DesiredForDevice(d)), managedSet())
 	r.UDID = udid
+	if !exceptions.IsEmpty() {
+		r.Exceptions = &exceptions
+	}
 	return r, nil
 }
 

@@ -110,6 +110,30 @@ always read back with `print-disabled` rather than trusted, and anything that
 does not work out returns `errOfflineIneffective` so `ensure` falls back to the
 `launchctl` path. A store problem must never surface as a command failure.
 
+**Per-simulator exceptions.** `exceptions.go` defines `Exceptions`, the
+categories and labels one simulator keeps enabled whatever profile slims it (the
+shape of a profile file's `except`/`keep`). They are stored in
+`simslim-exceptions.json` in the simulator's device directory (the parent of its
+`dataPath`), never in global state; a missing file means none, an unparsable one
+is an error, and writes are atomic. `ensure` (so `on`, `off`, and clone's
+reconfigure), `EnableSlimNoReboot` (so `watch`), and `VerifyProfile` apply them
+on top of the profile with `Exceptions.apply`; `EnableSlimNoReboot` also starts
+excepted labels it finds disabled. `CloneDevice` copies them to the clone;
+`simctl erase` only resets `data/`, so an erase keeps them, like `device.plist`.
+`live.go` holds `EnableServices`/`DisableServices` (`simslim enable`/`disable`),
+which record the exceptions first and then change the daemons: live on a booted
+device (`startServices`: one `launchctl load -w` per chunk via `loadJobs`, then
+per-label `enable` and `bootstrapJobs` for what is left; `stopServices`: the same
+unload/disable/bootout path `on --no-reboot` uses), or in the offline store on a
+shutdown one (`changeOffline`). Everything is read back; a label that loads only
+at the next boot is reported in `notStarted`, not as an error. `lock.go`'s
+`lockSimulator` (an flock on `simslim.lock` beside the exceptions) serializes
+`ensure`, `EnableSlimNoReboot`, and enable/disable on one simulator: each reads
+the exceptions only once it holds the lock, so a watch pass can never stop what
+a concurrent `enable` starts. Launchd reads (`readLaunchd`) and later
+`applyDelta` passes pause on `launchdRetryDelays`, because launchd_sim answers
+error 124 for a few seconds around a boot or reboot.
+
 **simctl wrapper.** `simctl.go` is the only place that shells out to
 `xcrun simctl` (list/boot/shutdown/clone/erase/delete/spawn). `measure.go` sums
 `phys_footprint` across the simulator's launchd process tree (via `pgrep`/`ps`/`top`)
@@ -123,7 +147,7 @@ separate, permanent disk-cleanup feature.
 
 **JSON is a contract.** Every read-only and management command supports `--json`.
 The structs in `output.go` (`DeviceSummary`, `StatusOutput`,
-`SimulatorMutationOutput`, etc.) plus the category/plan structs are the stable
+`SimulatorMutationOutput`, `ServicesOutput`, etc.) plus the category/plan structs are the stable
 interface the SwiftUI app decodes. Changing a JSON field breaks the GUI in
 `gui/*.swift` — keep them in sync. `gui/Backend.swift` invokes the bundled CLI
 with `--json` and decodes these types; there is no other IPC.

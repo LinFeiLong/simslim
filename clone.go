@@ -84,6 +84,10 @@ func CloneDevice(ctx context.Context, udid, name string) (newUDID string, err er
 		return "", fmt.Errorf("capture source service profile: %w", err)
 	}
 	desired := desiredCloneDisabled(disabled)
+	exceptions, err := ReadExceptions(source)
+	if err != nil {
+		return "", fmt.Errorf("capture source exceptions: %w", err)
+	}
 	if err := Shutdown(ctx, source.Set, udid); err != nil {
 		return "", fmt.Errorf("shutdown source before cloning: %w", err)
 	}
@@ -124,6 +128,11 @@ func CloneDevice(ctx context.Context, udid, name string) (newUDID string, err er
 		return "", err
 	}
 	if err := sanitizeClonedDeviceAt(paths); err != nil {
+		return "", err
+	}
+	// The clone keeps the source's exceptions, so `on` and `watch` leave the
+	// same daemons enabled on it.
+	if err := writeExceptions(Device{UDID: createdUDID, DataPath: paths.cloneDataDirectory}, exceptions); err != nil {
 		return "", err
 	}
 
