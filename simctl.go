@@ -382,18 +382,20 @@ func launchctlCmd(ctx context.Context, set, udid string, args ...string) *exec.C
 }
 
 // readLaunchd runs a read-only launchctl command inside the simulator, each
-// attempt bounded by SpawnTimeout. Only launchd_sim's transient error 124 is
-// retried, after each of launchdRetryDelays; any other failure is returned at
-// once.
+// attempt bounded by SpawnTimeout. launchd_sim's transient error 124 and an
+// attempt that ran out of time (a host so loaded that one read takes minutes)
+// are retried, after each of launchdRetryDelays; any other failure is returned
+// at once.
 func readLaunchd(ctx context.Context, set, udid string, args ...string) ([]byte, error) {
 	for attempt := 0; ; attempt++ {
 		spawnCtx, cancel := context.WithTimeout(ctx, SpawnTimeout)
 		out, err := launchctlCmd(spawnCtx, set, udid, args...).CombinedOutput()
+		timedOut := errors.Is(spawnCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err == nil {
 			return out, nil
 		}
-		settling := launchdSettling(err, out)
+		settling := launchdSettling(err, out) || timedOut
 		err = fmt.Errorf("launchctl %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
 		if !settling || attempt == len(launchdRetryDelays) || ctx.Err() != nil {
 			return nil, err

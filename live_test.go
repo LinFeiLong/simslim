@@ -378,6 +378,27 @@ func TestReadLaunchdRetriesOnlyTheTransientError(t *testing.T) {
 	}
 }
 
+// A read that runs out of time is retried: on a heavily loaded host one
+// `launchctl list` can take longer than SpawnTimeout and the next one succeed.
+func TestReadLaunchdRetriesATimedOutRead(t *testing.T) {
+	f := newBatchFake(t, "iOS-26-5", nil, "")
+	once := filepath.Join(t.TempDir(), "hang-once")
+	if err := os.WriteFile(once, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_HANG_ONCE", once)
+	savedTimeout, savedWait, savedDelays := SpawnTimeout, spawnWaitDelay, launchdRetryDelays
+	SpawnTimeout, spawnWaitDelay, launchdRetryDelays = 200*time.Millisecond, 100*time.Millisecond, []time.Duration{time.Millisecond}
+	t.Cleanup(func() { SpawnTimeout, spawnWaitDelay, launchdRetryDelays = savedTimeout, savedWait, savedDelays })
+
+	if _, err := readDisabled(context.Background(), "default", f.udid); err != nil {
+		t.Fatalf("readDisabled after one timed-out attempt = %v, want it retried", err)
+	}
+	if calls := xcrunCalls(t, f.log); len(calls) != 2 {
+		t.Errorf("readDisabled spawned %d times, want 2 (one timeout, one retry): %v", len(calls), calls)
+	}
+}
+
 // A spawn that times out while a child process still holds its output pipe
 // returns instead of waiting for that child forever, both for a read and for
 // a per-label transition.

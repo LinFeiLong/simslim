@@ -86,7 +86,8 @@ func TestLaunchdJobPlistsMatchesTheLabelInside(t *testing.T) {
 // way a simulator answers while its boot session starts or tears down.
 // FAKE_SPAWN_ERROR makes every spawn fail with another error, and FAKE_HANG
 // makes every spawn hang with a child process that keeps the output pipe open,
-// the way simctl outlives a killed xcrun.
+// the way simctl outlives a killed xcrun; FAKE_HANG_ONCE names a file whose
+// presence makes only the next spawn hang that way.
 const fakeBatchXcrun = `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$1 $2 $3" in
@@ -104,7 +105,8 @@ case "$1 $2" in
       exit 124
     fi
     [ -n "$FAKE_SPAWN_ERROR" ] && { echo "Invalid device state" >&2; exit 1; }
-    [ -n "$FAKE_HANG" ] && { sleep 10 & exec sleep 10; } ;;
+    [ -n "$FAKE_HANG" ] && { sleep 10 & exec sleep 10; }
+    [ -n "$FAKE_HANG_ONCE" ] && [ -e "$FAKE_HANG_ONCE" ] && { rm -f "$FAKE_HANG_ONCE"; sleep 10 & exec sleep 10; } ;;
   *) exit 99 ;;
 esac
 verb=$2
