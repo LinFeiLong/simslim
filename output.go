@@ -14,21 +14,20 @@ type DeviceSummary struct {
 
 type StatusOutput struct {
 	Status
-	Verdict    string            `json:"verdict"`
-	Dropped    []DroppedCategory `json:"dropped,omitempty"`    // only when `status --dropped` is requested
-	Exceptions *Exceptions       `json:"exceptions,omitempty"` // what `simslim enable` keeps enabled on this simulator
+	Verdict string            `json:"verdict"`
+	Dropped []DroppedCategory `json:"dropped,omitempty"` // only when `status --dropped` is requested
 }
 
 // ServicesOutput is returned by `enable` and `disable`: the managed daemons the
-// command changed and the simulator's exceptions afterwards.
+// command changed in the running boot session, and the profile file it saved.
 type ServicesOutput struct {
-	Action       string     `json:"action"` // "enable" or "disable"
-	UDID         string     `json:"udid"`
-	Live         bool       `json:"live"`                   // applied to the running boot session; otherwise at the next boot
-	Labels       []string   `json:"labels"`                 // daemons enabled, or stopped by disable
-	NotStarted   []string   `json:"notStarted,omitempty"`   // enable: re-enabled, but launchd starts them only at the next boot
-	StillEnabled []string   `json:"stillEnabled,omitempty"` // disable: kept running by a remaining exception or the platform
-	Exceptions   Exceptions `json:"exceptions"`             // the simulator's exceptions afterwards
+	Action       string   `json:"action"` // "enable" or "disable"
+	UDID         string   `json:"udid"`
+	Live         bool     `json:"live"`                   // false: the simulator is not booted, only the profile was saved
+	Labels       []string `json:"labels"`                 // daemons enabled, or stopped by disable
+	NotStarted   []string `json:"notStarted,omitempty"`   // enable: re-enabled, but launchd starts them only at the next boot
+	StillEnabled []string `json:"stillEnabled,omitempty"` // disable: kept running for another fully enabled category or the platform
+	Saved        string   `json:"saved,omitempty"`        // the profile file --save created or updated
 }
 
 // DroppedCategory lists the managed launchd labels a category has disabled on a

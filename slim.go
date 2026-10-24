@@ -32,25 +32,7 @@ func ensure(ctx context.Context, set, udid string, desired map[string]bool, repo
 	if err != nil {
 		return false, err
 	}
-	unlock, waited, err := lockSimulator(ctx, d, report)
-	if err != nil {
-		return false, err
-	}
-	defer unlock()
-	if waited {
-		// A watch pass that held the lock may have changed its state.
-		if d, err = FindDevice(ctx, udid, set); err != nil {
-			return false, err
-		}
-	}
 	desired = desiredForDevice(d, desired)
-	// The simulator's own exceptions win over every profile, including the
-	// state a clone captured from its source.
-	exceptions, err := ReadExceptions(d)
-	if err != nil {
-		return false, err
-	}
-	desired = exceptions.apply(desired)
 	persistent := d.SupportsPersistentOverrides()
 	if len(desired) > 0 && !persistent {
 		return false, fmt.Errorf("%s runtime cannot persist launchd disable overrides across reboot; simslim requires %s %s or newer, or `simslim on --no-reboot` to slim the current boot session only", d.RuntimeName(), d.PlatformName(), d.minimumPersistentVersion())
@@ -224,8 +206,7 @@ func (d Device) SupportsPersistentOverrides() bool {
 	return majorErr == nil && minorErr == nil && minor >= 0 && (major > minimumMajor || major == minimumMajor && minor >= 5)
 }
 
-// enableSlim disables the profile's daemons and boots the device slim. The
-// simulator's exceptions stay enabled whatever the profile says.
+// enableSlim disables the profile's daemons and boots the device slim.
 func EnableSlim(ctx context.Context, set, udid string, p Profile, report Reporter) (bool, error) {
 	return ensure(ctx, set, udid, p.Desired(), report)
 }
@@ -234,30 +215,15 @@ func EnableSlim(ctx context.Context, set, udid string, p Profile, report Reporte
 // daemon the profile disables is booted out of launchd, and the disable
 // override keeps launchd from respawning it. It works on every runtime, but on
 // runtimes without persistent overrides the simulator comes back stock at its
-// next boot. The simulator's exceptions win over the profile: they are never
-// stopped, and any found disabled is started again live. Otherwise live
-// slimming only moves toward more-disabled: other managed labels disabled
-// beyond the profile are left alone; `enable` or `off` restores them.
+// next boot. Live slimming only moves toward more-disabled: managed labels
+// disabled beyond the profile are left alone, because a live re-enable would
+// have to bootstrap each daemon again; `off` restores them with a reboot.
 func EnableSlimNoReboot(ctx context.Context, set, udid string, p Profile, report Reporter) (changed bool, err error) {
 	d, err := FindDevice(ctx, udid, set)
 	if err != nil {
 		return false, err
 	}
-	// Held to the last transition, so `enable` cannot start a daemon this pass
-	// is about to stop, and the exceptions are read only once it is ours.
-	unlock, _, err := lockSimulator(ctx, d, report)
-	if err != nil {
-		return false, err
-	}
-	defer unlock()
-	exceptions, err := ReadExceptions(d)
-	if err != nil {
-		return false, err
-	}
-	desired := exceptions.apply(p.DesiredForDevice(d))
-	if !exceptions.IsEmpty() {
-		report.report("Keeping this simulator's exceptions enabled: " + exceptions.String())
-	}
+	desired := p.DesiredForDevice(d)
 	report.report("Booting the simulator (a first boot can take up to a minute)...")
 	if err := BootAndWait(ctx, set, udid); err != nil {
 		return false, err
@@ -268,21 +234,14 @@ func EnableSlimNoReboot(ctx context.Context, set, udid string, p Profile, report
 	}
 	managed := managedSet()
 	toDisable, extra := delta(current, desired, managed)
-	restart, beyond := splitByExceptions(extra, exceptions.labels())
-	if len(beyond) > 0 {
-		report.report(fmt.Sprintf("Leaving %d services disabled beyond this profile; `simslim enable` or `simslim off` re-enables them.", len(beyond)))
-	}
-	if len(restart) > 0 {
-		report.report(fmt.Sprintf("Starting %d services this simulator keeps as exceptions...", len(restart)))
-		if _, err := startServices(ctx, d, restart, report); err != nil {
-			return false, err
-		}
+	if len(extra) > 0 {
+		report.report(fmt.Sprintf("Leaving %d services disabled beyond this profile; only `simslim off` re-enables them.", len(extra)))
 	}
 	// Check every profiled label, not just those without an override: an
 	// override says nothing about whether the job is still loaded (an earlier
 	// run may have disabled it and then failed to boot it out). Labels that are
 	// both disabled and unloaded are skipped, so the command stays idempotent.
-	changed = len(toDisable) > 0 || len(restart) > 0
+	changed = len(toDisable) > 0
 	labels := make([]string, 0, len(desired))
 	for l := range desired {
 		if managed[l] {
@@ -291,7 +250,18 @@ func EnableSlimNoReboot(ctx context.Context, set, udid string, p Profile, report
 	}
 	sort.Strings(labels)
 	report.report(fmt.Sprintf("Stopping %d background services for this boot session...", len(labels)))
-	return changed, stopServices(ctx, d, labels, report)
+	remaining := unloadInBatch(ctx, set, udid, d.RuntimeID, labels, readPlistLabel, report)
+	if err := applyDelta(ctx, set, udid, remaining, nil, liveDisable, report); err != nil {
+		return changed, err
+	}
+	after, err := readDisabled(ctx, set, udid)
+	if err != nil {
+		return changed, err
+	}
+	if missing, _ := delta(after, desired, managed); len(missing) > 0 {
+		return changed, fmt.Errorf("%d of %d disable overrides did not take", len(missing), len(labels))
+	}
+	return changed, nil
 }
 
 // unloadInBatch disables and unloads the labels whose job plist it can find with

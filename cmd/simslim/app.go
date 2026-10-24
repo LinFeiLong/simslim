@@ -66,10 +66,13 @@ func newApp() *cli.Command {
 		{Name: "off", Flags: []cli.Flag{
 			preserveBootStateFlag("return an initially shutdown simulator to shutdown after reconfiguration"),
 		}, Action: cmdOff},
-		{Name: "enable", Flags: []cli.Flag{jsonFlag()}, Action: cmdEnable},
+		{Name: "enable", Flags: []cli.Flag{
+			jsonFlag(),
+			&cli.StringFlag{Name: "save", Usage: "also add the services to this profile file, creating it if needed"},
+		}, Action: cmdEnable},
 		{Name: "disable", Flags: []cli.Flag{
 			jsonFlag(),
-			&cli.BoolFlag{Name: "all", Usage: "clear every exception the simulator keeps and stop its daemons"},
+			&cli.StringFlag{Name: "save", Usage: "also remove the services from this profile file, creating it if needed"},
 		}, Action: cmdDisable},
 		{Name: "watch", Flags: []cli.Flag{
 			&cli.StringFlag{Name: "profile", Usage: "apply a JSON profile file (mutually exclusive with --except/--keep)"},

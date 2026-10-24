@@ -148,9 +148,8 @@ func TestAppEnableDisableArguments(t *testing.T) {
 		{name: "enable without a UDID", args: []string{"enable"}, want: "expected a simulator UDID"},
 		{name: "enable without IDs", args: []string{"enable", udid}, want: "name at least one category ID"},
 		{name: "enable an unknown ID", args: []string{"enable", udid, "icloud,nope"}, want: `"nope"`},
-		{name: "disable without IDs", args: []string{"disable", udid}, want: "or pass --all"},
-		{name: "disable IDs and --all", args: []string{"disable", udid, "icloud", "--all"}, want: "not both"},
-		{name: "disable --all before IDs", args: []string{"disable", "--all", udid, "icloud"}, want: "not both"},
+		{name: "disable without IDs", args: []string{"disable", udid}, want: "name at least one category ID or managed daemon to disable"},
+		{name: "disable --all is gone", args: []string{"disable", udid, "--all"}, want: "flag provided but not defined"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

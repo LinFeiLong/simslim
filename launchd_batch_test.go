@@ -88,7 +88,7 @@ const fakeBatchXcrun = `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$1 $2 $3" in
   "simctl list runtimes") printf '{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.%s","runtimeRoot":"%s"}]}\n' "$FAKE_RUNTIME" "$FAKE_ROOT"; exit 0 ;;
-  "simctl list devices")  printf '{"devices":{"com.apple.CoreSimulator.SimRuntime.%s":[{"udid":"%s","name":"Batch","state":"%s","isAvailable":true,"dataPath":"%s"}]}}\n' "$FAKE_RUNTIME" "$FAKE_UDID" "${FAKE_STATE:-Booted}" "$FAKE_DATA"; exit 0 ;;
+  "simctl list devices")  printf '{"devices":{"com.apple.CoreSimulator.SimRuntime.%s":[{"udid":"%s","name":"Batch","state":"%s","isAvailable":true,"dataPath":"/tmp/batch"}]}}\n' "$FAKE_RUNTIME" "$FAKE_UDID" "${FAKE_STATE:-Booted}"; exit 0 ;;
 esac
 case "$1 $2" in
   "simctl boot"|"simctl bootstatus") exit 0 ;;
@@ -135,7 +135,7 @@ exit 0
 // batchFake is a booted simulator whose launchd state lives in files, with a
 // RuntimeRoot holding a job plist for every label except withoutPlist.
 type batchFake struct {
-	udid, dis, loaded, stuck, noload, teardown, data, log string
+	udid, dis, loaded, stuck, noload, teardown, log string
 }
 
 func newBatchFake(t *testing.T, runtime string, labels []string, withoutPlist string) batchFake {
@@ -148,7 +148,6 @@ func newBatchFake(t *testing.T, runtime string, labels []string, withoutPlist st
 		stuck:    filepath.Join(dir, "stuck"),
 		noload:   filepath.Join(dir, "noload"),
 		teardown: filepath.Join(dir, "teardown"),
-		data:     filepath.Join(dir, "data"),
 		log:      filepath.Join(dir, "calls.log"),
 	}
 	root := filepath.Join(dir, "RuntimeRoot")
@@ -175,7 +174,6 @@ func newBatchFake(t *testing.T, runtime string, labels []string, withoutPlist st
 	t.Setenv("FAKE_STUCK", f.stuck)
 	t.Setenv("FAKE_NOLOAD", f.noload)
 	t.Setenv("FAKE_TEARDOWN", f.teardown)
-	t.Setenv("FAKE_DATA", f.data)
 	t.Setenv("FAKE_ROOT", root)
 	t.Setenv("FAKE_RUNTIME", runtime)
 	t.Setenv("FAKE_UDID", f.udid)

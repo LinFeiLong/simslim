@@ -3,18 +3,20 @@ package simslim
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
 
 // EnableServices re-enables categories (IDs from `simslim profiles`) and
-// individual managed daemons on one simulator and records them as its
-// exceptions, so `on` and `watch` keep them enabled from then on. A booted
-// simulator gets them back at once, without a reboot: each disable override is
-// lifted and each job loaded into the running boot session. A shutdown one has
-// the overrides lifted in the store launchd_sim reads when it starts, so it
-// boots with them; a runtime that cannot persist overrides boots stock anyway.
-func EnableServices(ctx context.Context, udid string, ids []string, report Reporter) (ServicesOutput, error) {
+// individual managed daemons on a booted simulator, live, without a reboot:
+// each disable override is lifted and each job loaded into the running boot
+// session. It keeps no state of its own, like `on --no-reboot`: the next `on`
+// or `watch` pass applies its profile again. With save, the change is also
+// written to that profile file (see SaveServices), which is how it persists; a
+// simulator that is not booted then only gets the file, and without save it is
+// an error.
+func EnableServices(ctx context.Context, udid string, ids []string, save string, report Reporter) (ServicesOutput, error) {
 	categories, labels, err := resolveServiceIDs(ids)
 	if err != nil {
 		return ServicesOutput{}, err
@@ -22,54 +24,41 @@ func EnableServices(ctx context.Context, udid string, ids []string, report Repor
 	if len(categories)+len(labels) == 0 {
 		return ServicesOutput{}, fmt.Errorf("name at least one category ID or managed daemon to enable (see `simslim profiles`)")
 	}
-	d, unlock, err := lockedTarget(ctx, udid, report)
+	d, err := serviceTarget(ctx, udid, save)
 	if err != nil {
 		return ServicesOutput{}, err
 	}
-	defer unlock()
-	exceptions, err := ReadExceptions(d)
-	if err != nil {
-		return ServicesOutput{}, err
+	out := ServicesOutput{Action: "enable", UDID: d.UDID, Live: d.State == "Booted", Labels: []string{}}
+	if save != "" {
+		if err := SaveServices(save, categories, labels, true); err != nil {
+			return out, err
+		}
+		out.Saved = save
 	}
-	exceptions = exceptions.with(categories, labels)
-	// Recorded first: if the live part fails, the next `on` or `watch` still
-	// honours the request, and re-running this command finishes the job.
-	if err := writeExceptions(d, exceptions); err != nil {
-		return ServicesOutput{}, err
-	}
-	targets := sortedKeys(coveredLabels(categories, labels))
-	out := ServicesOutput{Action: "enable", UDID: d.UDID, Live: d.State == "Booted", Labels: targets, Exceptions: exceptions}
 	if !out.Live {
-		changeOffline(d, nil, targets, report)
 		return out, nil
 	}
-	if err := BootAndWait(ctx, d.Set, d.UDID); err != nil {
-		return out, err
-	}
-	report.report(fmt.Sprintf("Starting %d background services without a reboot...", len(targets)))
-	out.NotStarted, err = startServices(ctx, d, targets, report)
+	out.Labels = sortedKeys(coveredLabels(categories, labels))
+	report.report(fmt.Sprintf("Starting %d background services without a reboot...", len(out.Labels)))
+	out.NotStarted, err = startServices(ctx, d, out.Labels, report)
 	return out, err
 }
 
-// DisableServices is the inverse of EnableServices: it drops categories and
-// daemons from the simulator's exceptions and stops their daemons at once —
-// each one booted out of the running boot session with its disable override
-// set, no reboot — or, on a shutdown simulator, disables them in the store it
-// boots from. It stops what it is told whatever the profile says. A daemon that
-// a remaining exception still lists, or that the platform needs, stays
-// enabled. With all, every exception goes and its daemons are stopped, which
-// returns the simulator to plain profile slimming.
-func DisableServices(ctx context.Context, udid string, ids []string, all bool, report Reporter) (ServicesOutput, error) {
+// DisableServices is the inverse of EnableServices: it stops categories and
+// daemons on a booted simulator at once, each one booted out of the running
+// boot session with its disable override set, no reboot. It stops what it is
+// told whatever the profile says, with two exceptions: a daemon the platform
+// needs, and a daemon shared with another category that is fully enabled right
+// now (iCloud and the store share the AMS daemons), stay enabled and are
+// reported in StillEnabled. With save, the categories and daemons are also
+// removed from that profile file.
+func DisableServices(ctx context.Context, udid string, ids []string, save string, report Reporter) (ServicesOutput, error) {
 	categories, labels, err := resolveServiceIDs(ids)
 	if err != nil {
 		return ServicesOutput{}, err
 	}
-	named := len(categories)+len(labels) > 0
-	switch {
-	case all && named:
-		return ServicesOutput{}, fmt.Errorf("pass category IDs and daemons, or --all, not both")
-	case !all && !named:
-		return ServicesOutput{}, fmt.Errorf("name at least one category ID or managed daemon to disable, or pass --all to clear every exception (see `simslim profiles`)")
+	if len(categories)+len(labels) == 0 {
+		return ServicesOutput{}, fmt.Errorf("name at least one category ID or managed daemon to disable (see `simslim profiles`)")
 	}
 	slimmable := SlimmableSet()
 	for _, l := range labels {
@@ -77,113 +66,128 @@ func DisableServices(ctx context.Context, udid string, ids []string, all bool, r
 			return ServicesOutput{}, fmt.Errorf("%s is never disabled: simslim keeps it running for compatibility (see `simslim profiles`)", l)
 		}
 	}
-	d, unlock, err := lockedTarget(ctx, udid, report)
+	d, err := serviceTarget(ctx, udid, save)
 	if err != nil {
 		return ServicesOutput{}, err
 	}
-	defer unlock()
-	exceptions, err := ReadExceptions(d)
-	if err != nil {
-		return ServicesOutput{}, err
+	out := ServicesOutput{Action: "disable", UDID: d.UDID, Live: d.State == "Booted", Labels: []string{}}
+	if save != "" {
+		if err := SaveServices(save, categories, labels, false); err != nil {
+			return out, err
+		}
+		out.Saved = save
 	}
-	remaining := exceptions.without(categories, labels)
-	if all {
-		categories, labels, remaining = exceptions.Except, exceptions.Keep, Exceptions{}
+	if !out.Live {
+		return out, nil
+	}
+	disabled, err := readDisabled(ctx, d.Set, d.UDID)
+	if err != nil {
+		return out, err
 	}
 	covered := coveredLabels(categories, labels)
 	allowed := desiredForDevice(d, covered)
-	kept := remaining.labels()
-	stop, still := []string{}, []string(nil)
+	kept := enabledNeighbours(covered, categories, disabled)
 	for _, l := range sortedKeys(covered) {
 		if allowed[l] && slimmable[l] && !kept[l] {
-			stop = append(stop, l)
+			out.Labels = append(out.Labels, l)
 		} else {
-			still = append(still, l)
+			out.StillEnabled = append(out.StillEnabled, l)
 		}
 	}
-	if err := writeExceptions(d, remaining); err != nil {
-		return ServicesOutput{}, err
-	}
-	out := ServicesOutput{Action: "disable", UDID: d.UDID, Live: d.State == "Booted", Labels: stop, StillEnabled: still, Exceptions: remaining}
-	if len(stop) == 0 {
+	if len(out.Labels) == 0 {
 		return out, nil
 	}
-	if !out.Live {
-		changeOffline(d, stop, nil, report)
-		return out, nil
+	report.report(fmt.Sprintf("Stopping %d background services without a reboot...", len(out.Labels)))
+	return out, stopServices(ctx, d, out.Labels, report)
+}
+
+// enabledNeighbours returns the labels in covered that another category, one
+// not being disabled and with every label enabled right now, also lists. Only
+// the live state says which features are on, so that is what decides: stopping
+// the store keeps the AMS daemons iCloud shares while iCloud is fully running.
+func enabledNeighbours(covered map[string]bool, disabling []string, disabled map[string]bool) map[string]bool {
+	kept := map[string]bool{}
+	for _, c := range Categories {
+		if slices.Contains(disabling, c.ID) {
+			continue
+		}
+		enabled, shares := true, false
+		for _, l := range c.Labels {
+			enabled = enabled && !disabled[l]
+			shares = shares || covered[l]
+		}
+		if !enabled || !shares {
+			continue
+		}
+		for _, l := range c.Labels {
+			if covered[l] {
+				kept[l] = true
+			}
+		}
 	}
-	if err := BootAndWait(ctx, d.Set, d.UDID); err != nil {
-		return out, err
-	}
-	report.report(fmt.Sprintf("Stopping %d background services without a reboot...", len(stop)))
-	return out, stopServices(ctx, d, stop, report)
+	return kept
 }
 
 // serviceTarget resolves the exact simulator `enable` and `disable` act on, so
-// a simctl alias such as "all" can never fan out across devices.
-func serviceTarget(ctx context.Context, udid string) (Device, error) {
+// a simctl alias such as "all" can never fan out across devices. Only a booted
+// simulator can change live; with a profile to save, any simulator is fine,
+// since only the file changes.
+func serviceTarget(ctx context.Context, udid, save string) (Device, error) {
 	d, err := FindDevice(ctx, udid, "")
 	if err != nil {
 		return Device{}, err
 	}
-	if d.State != "Booted" && d.State != "Shutdown" {
-		return Device{}, fmt.Errorf("simulator must be booted or shut down to change its services (it is %s)", d.State)
+	if d.State != "Booted" && save == "" {
+		return Device{}, fmt.Errorf("simulator %s is not booted (it is %s): enable and disable change a running simulator only; pass --save <profile.json> to record the change, then apply it with `simslim on %s --profile <profile.json>`", d.UDID, d.State, d.UDID)
 	}
 	return d, nil
 }
 
-// lockedTarget resolves the simulator and takes its lock, resolving it again
-// after a wait: the watch pass or `on` that held the lock may have rebooted or
-// shut it down.
-func lockedTarget(ctx context.Context, udid string, report Reporter) (Device, func(), error) {
-	d, err := serviceTarget(ctx, udid)
-	if err != nil {
-		return Device{}, nil, err
+// resolveServiceIDs sorts the IDs `enable` and `disable` accept into category
+// IDs and individual managed labels, rejecting anything else.
+func resolveServiceIDs(ids []string) (categories, labels []string, err error) {
+	managed := managedSet()
+	seenCategory, seenLabel := map[string]bool{}, map[string]bool{}
+	for _, id := range ids {
+		switch {
+		case seenCategory[id] || seenLabel[id]:
+		case isCategory(id):
+			seenCategory[id] = true
+			categories = append(categories, id)
+		case managed[id]:
+			seenLabel[id] = true
+			labels = append(labels, id)
+		default:
+			return nil, nil, fmt.Errorf("unknown category or managed daemon %q (see `simslim profiles`)", id)
+		}
 	}
-	unlock, waited, err := lockSimulator(ctx, d, report)
-	if err != nil {
-		return Device{}, nil, err
-	}
-	if !waited {
-		return d, unlock, nil
-	}
-	if d, err = serviceTarget(ctx, udid); err != nil {
-		unlock()
-		return Device{}, nil, err
-	}
-	return d, unlock, nil
+	sort.Strings(categories)
+	sort.Strings(labels)
+	return categories, labels, nil
 }
 
-// changeOffline applies transitions to a shutdown simulator by writing the
-// store launchd_sim reads when it boots. A runtime that cannot persist
-// overrides boots stock, so there is nothing to write. The store is best
-// effort, as everywhere: if it cannot be written, the recorded exceptions
-// still steer the next `on` or `watch` once the simulator is up.
-func changeOffline(d Device, toDisable, toEnable []string, report Reporter) {
-	if !d.SupportsPersistentOverrides() {
-		return
-	}
-	current, err := readDisabledStore(d.UDID)
-	if err == nil {
-		var dis, en []string
-		for _, l := range toDisable {
-			if !current[l] {
-				dis = append(dis, l)
+func isCategory(id string) bool {
+	_, ok := CategoryByID(id)
+	return ok
+}
+
+// coveredLabels is every managed label the categories and labels name.
+func coveredLabels(categories, labels []string) map[string]bool {
+	covered := map[string]bool{}
+	for _, id := range categories {
+		if c, ok := CategoryByID(id); ok {
+			for _, l := range c.Labels {
+				covered[l] = true
 			}
 		}
-		for _, l := range toEnable {
-			if current[l] {
-				en = append(en, l)
-			}
-		}
-		if len(dis)+len(en) == 0 {
-			return
-		}
-		err = writeDisabledStore(d.UDID, dis, en)
 	}
-	if err != nil {
-		report.report(fmt.Sprintf("Could not update the launchd overrides while the simulator is off (%v); `simslim on` or `simslim watch` applies the change once it boots.", err))
+	managed := managedSet()
+	for _, l := range labels {
+		if managed[l] {
+			covered[l] = true
+		}
 	}
+	return covered
 }
 
 // startServices lifts the disable override of each label and loads its job into
@@ -321,19 +325,4 @@ func stopServices(ctx context.Context, d Device, labels []string, report Reporte
 		return fmt.Errorf("%d of %d disable overrides did not take", missing, len(labels))
 	}
 	return nil
-}
-
-// splitByExceptions separates the labels disabled beyond a profile into those
-// the simulator's exceptions keep enabled, which must start again, and the rest.
-func splitByExceptions(extra []string, kept map[string]bool) (restart, beyond []string) {
-	for _, l := range extra {
-		if kept[l] {
-			restart = append(restart, l)
-		} else {
-			beyond = append(beyond, l)
-		}
-	}
-	sort.Strings(restart)
-	sort.Strings(beyond)
-	return restart, beyond
 }

@@ -95,8 +95,8 @@ simslim on <udid>        # slim a simulator and reboot it slim
 simslim on <udid> --no-reboot   # slim the current boot session, no reboot
 simslim off <udid>       # put it back to stock
 simslim enable <udid> icloud,photos   # turn services back on now, no reboot
-simslim disable <udid> icloud         # turn them off again now (--all: every exception)
-simslim status <udid>    # managed launchd-label state and the simulator's exceptions
+simslim disable <udid> icloud         # turn them off again now
+simslim status <udid>    # managed launchd-label state (not a process count)
 simslim verify <udid> --profile ci.json   # exact profile match; non-zero on drift
 simslim doctor <udid> --requires push,storekit,universal-links
 simslim measure <udid>   # a booted simulator's memory footprint
@@ -246,10 +246,8 @@ simslim verify <udid> --profile ci.json || simslim on <udid> --profile ci.json
 ```
 
 Where `doctor` answers "do the features my tests need still work?", `verify`
-answers "is this simulator in exactly the slim state I configured?". A
-simulator's [exceptions](#turning-services-back-on-without-a-reboot) count as
-part of the profile, as `on` and `watch` apply them, and `verify` names them.
-Supports `--json`.
+answers "is this simulator in exactly the slim state I configured?". Supports
+`--json`.
 
 ### Slimming without a reboot
 
@@ -275,25 +273,22 @@ it is the only way to slim at all, and the state is
 gone at the next reboot: re-run it after every boot. `status` says so when it
 reads such a simulator, and `status --json` carries a `persistent` field.
 
-Live slimming leaves managed daemons already disabled beyond the profile alone:
-`simslim enable` turns them back on without a reboot, and `simslim off`
-restores them all with one. The simulator's exceptions are the one thing it
-starts: they are never stopped, and any found disabled is started again.
+Live slimming only moves toward more-disabled. Managed daemons already disabled
+beyond the profile are left alone, because starting a daemon again live would
+need a per-label bootstrap; `simslim enable` turns them back on without a
+reboot, and `simslim off` restores them all with one.
 
 ### Turning services back on without a reboot
 
 A slim simulator sometimes needs a feature back for a while: iCloud for a sync
 test, Photos for a picker. `enable` turns categories (IDs from
 `simslim profiles`) or individual managed daemons back on in the running
-simulator, with no reboot, and `disable` turns them off again. The pair mirrors
-`on`/`off`, which slim or restore the whole simulator; these act on the
-services you name.
+simulator, with no reboot, and `disable` turns them off again.
 
 ```sh
 simslim enable <udid> icloud,photos       # or: simslim enable <udid> icloud com.apple.apsd
 simslim doctor <udid> --requires icloud   # ok at once
 simslim disable <udid> icloud             # off again, still no reboot
-simslim disable <udid> --all              # drop every exception: back to the profile
 ```
 
 `enable` lifts each disable override and loads the job into the current boot
@@ -302,26 +297,29 @@ of them; any daemon still disabled then gets its own `launchctl enable`, and any
 still not loaded its own `launchctl bootstrap`. Everything is read back. A
 daemon launchd re-enables but will not load mid-session (iOS 27's
 `cloudsettingssyncagent`, for one) starts at the next boot, and the command
-says so. On a shutdown simulator both commands only rewrite the overrides it
-boots with.
+says so. `disable` stops what you name the way `on --no-reboot` does, whatever
+the profile says, except a daemon the platform needs and a daemon shared with
+another category that is fully enabled right now: `disable store` leaves the
+AMS daemons running while iCloud is on. Both list what stayed on.
 
-What you enable becomes one of the simulator's **exceptions**, and exceptions
-win over every profile: `on`, `watch`, and `verify` merge them into whatever
-profile they apply. A simulator with iCloud re-enabled keeps it through
-reboots, through `simslim on --profile ci.json`, and under a `watch` whose
-profile turns everything off. `status` lists them (`exceptions` in
-`status --json`). `off` and `erase` leave them recorded; `disable --all` clears
-them. `enable`, `disable`, `on`, and each `watch` pass take a per-simulator
-lock, so `enable` run while the watch is still slimming a fresh boot waits for
-it, and the watch never stops a service `enable` has just started.
+Like `on --no-reboot`, both act on the running boot session only and keep no
+state: the profile stays the one description of a slim simulator, so the next
+`on` or `watch` pass applies its profile again, and `verify` compares against
+the profile alone. They need a booted simulator. To go back to the profile
+without a reboot, run `simslim on <udid> --no-reboot --profile ci.json`.
 
-`disable` drops what you name from the exceptions and stops those daemons now,
-disabling each and booting it out of launchd as `on --no-reboot` does; a daemon
-that a remaining exception still needs keeps running. That is not the same as
-`on --no-reboot`, which applies a whole profile around the exceptions and leaves
-them as they are. `disable` stops what you name whatever the profile says: a
-category the profile itself keeps comes back at the next `simslim on`, while
-`on --no-reboot` and `watch` leave it off until `enable` or `off`.
+To make a change last, add `--save <profile.json>`: the command also adds the
+category to the file's `except` (a daemon to its `keep`), or removes it. A
+missing file is created from the default profile, the one `on` uses without
+`--profile`; entries keep their order and are never listed twice. Then `on`,
+`watch`, and `verify` with that profile agree with what you enabled. On a
+simulator that is not booted, `--save` only writes the file; apply it with
+`simslim on <udid> --profile <profile.json>`.
+
+```sh
+simslim enable <udid> icloud --save dev.json   # on now, and in dev.json
+simslim watch --profile dev.json               # keeps iCloud on at every boot
+```
 
 ### Slimming parallel-testing clones
 
@@ -341,9 +339,7 @@ xcodebuild test -scheme App -parallel-testing-enabled YES -parallel-testing-work
 ```
 
 It takes the same `--profile`/`--except`/`--keep` selection as `on`, and scans
-the default and `testing` sets plus any passed with `--set`. Each simulator
-keeps its own exceptions: one with iCloud re-enabled by `simslim enable` gets
-iCloud back at every boot, whatever the watch profile says. Point `--set` at a
+the default and `testing` sets plus any passed with `--set`. Point `--set` at a
 custom parallel-testing device set if your Xcode uses one. It runs until Ctrl-C.
 
 ## Disk cleanup
@@ -418,8 +414,7 @@ The package never writes to stdout — it returns values and reports progress
 through the `simslim.Reporter` callback you pass in. `simslim.Categories`,
 `simslim.Features`, and `simslim.SlimmableSet()` expose the same allowlist the
 CLI uses; `simslim.EnableServices`, `simslim.DisableServices`, and
-`simslim.ReadExceptions` manage a simulator's exceptions. macOS only, since
-everything runs through `xcrun simctl`.
+`simslim.SaveServices` back `enable`, `disable`, and `--save`. macOS only, since everything runs through `xcrun simctl`.
 
 ## How it works
 
@@ -439,15 +434,10 @@ read back after boot, and the command fails instead of claiming success if any
 requested override was lost. `off` remains available on older runtimes.
 
 This is per-simulator state, not a global setting. The daemon disables live in
-that one simulator's launchd database and nowhere else. The exceptions that
-`simslim enable` records sit with the simulator too, in `simslim-exceptions.json`
-in its own device directory, beside its `device.plist`: nothing global holds
-them, and deleting the simulator deletes them. An erase keeps them, as it keeps
-`device.plist`: it only resets the data directory. `simslim clone` copies the
-source's exact SimSlim-managed profile and exceptions along with its installed
-apps, app data, and settings. It also rebases simulator-local symlinks,
-regenerates app registration databases, and clears copied system caches and
-temporary files.
+that one simulator's launchd database and nowhere else. `simslim clone` copies
+the source's exact SimSlim-managed profile along with its installed apps, app
+data, and settings. It also rebases simulator-local symlinks, regenerates app
+registration databases, and clears copied system caches and temporary files.
 Before finishing, it boots the clone and audits its running processes for open
 paths into the source. The clone finishes shutdown, and the source returns to
 the boot state it had before cloning.
