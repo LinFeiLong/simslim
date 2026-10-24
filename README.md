@@ -416,7 +416,8 @@ The package never writes to stdout — it returns values and reports progress
 through the `simslim.Reporter` callback you pass in. `simslim.Categories`,
 `simslim.Features`, and `simslim.SlimmableSet()` expose the same allowlist the
 CLI uses; `simslim.EnableServices`, `simslim.DisableServices`, and
-`simslim.SaveServices` back `enable`, `disable`, and `--save`. macOS only, since everything runs through `xcrun simctl`.
+`simslim.SaveServices` back `enable`, `disable`, and `--save`. macOS only,
+since everything runs through `xcrun simctl`.
 
 ## How it works
 

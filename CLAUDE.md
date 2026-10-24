@@ -121,14 +121,15 @@ Everything is read back; a label that loads only at the next boot is reported in
 with another category whose labels are all enabled right now
 (`enabledNeighbours`), and reports it in `stillEnabled`; a label named on its
 own is always stopped. A simulator that is not booted is an error unless
-`--save` is given. `--save` validates the file first and writes it only after
-the live change succeeded. `profile_save.go`'s `SaveServices` (`--save <file>`) adds or
+`--save` is given. `profile_save.go`'s `SaveServices` (`--save <file>`) adds or
 removes categories in a profile file's `except` and labels in its `keep`,
 keeping order and other fields, skipping duplicates, starting a missing file
-from the default (empty) profile, and writing atomically. Launchd reads
-(`readLaunchd`) retry only launchd_sim's error 124 ("Domain is tearing down",
-answered for a few seconds around a boot or reboot) on `launchdRetryDelays`, and
-later `applyDelta` passes pause on the same delays. Reads and per-label
+from the default (empty) profile, and writing atomically; the file is validated
+first and written only after the live change succeeded. Launchd reads
+(`readLaunchd`) retry launchd_sim's error 124 ("Domain is tearing down",
+answered for a few seconds around a boot or reboot) and an attempt that ran out
+of `SpawnTimeout`, on `launchdRetryDelays`, and nothing else; later
+`applyDelta` passes pause on the same delays. Reads and per-label
 transitions go through `launchctlCmd`, whose `WaitDelay` abandons the output
 pipe a killed xcrun's simctl child would otherwise hold open forever.
 
@@ -145,10 +146,11 @@ separate, permanent disk-cleanup feature.
 
 **JSON is a contract.** Every read-only and management command supports `--json`.
 The structs in `output.go` (`DeviceSummary`, `StatusOutput`,
-`SimulatorMutationOutput`, `ServicesOutput`, etc.) plus the category/plan structs are the stable
-interface the SwiftUI app decodes. Changing a JSON field breaks the GUI in
-`gui/*.swift` — keep them in sync. `gui/Backend.swift` invokes the bundled CLI
-with `--json` and decodes these types; there is no other IPC.
+`SimulatorMutationOutput`, `ServicesOutput`, etc.) plus the category/plan
+structs are the stable interface the SwiftUI app decodes. Changing a JSON
+field breaks the GUI in `gui/*.swift` — keep them in sync. `gui/Backend.swift`
+invokes the bundled CLI with `--json` and decodes these types; there is no
+other IPC.
 
 **The SwiftUI app** (`gui/`) has no Xcode project. `scripts/build-app.sh` compiles
 the Swift sources directly with `swiftc`, cross-builds the Go CLI, bundles it into
