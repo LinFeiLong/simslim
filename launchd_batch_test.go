@@ -84,6 +84,9 @@ func TestLaunchdJobPlistsMatchesTheLabelInside(t *testing.T) {
 // device state the listing reports. While $FAKE_TEARDOWN holds a positive
 // count, each spawn uses one up and fails with launchd_sim's error 124, the
 // way a simulator answers while its boot session starts or tears down.
+// FAKE_SPAWN_ERROR makes every spawn fail with another error, and FAKE_HANG
+// makes every spawn hang with a child process that keeps the output pipe open,
+// the way simctl outlives a killed xcrun.
 const fakeBatchXcrun = `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$1 $2 $3" in
@@ -99,7 +102,9 @@ case "$1 $2" in
       echo $((n - 1)) > "$FAKE_TEARDOWN"
       echo "An error was encountered processing the command (domain=com.apple.CoreSimulator.LaunchdSimError, code=124): Domain is tearing down" >&2
       exit 124
-    fi ;;
+    fi
+    [ -n "$FAKE_SPAWN_ERROR" ] && { echo "Invalid device state" >&2; exit 1; }
+    [ -n "$FAKE_HANG" ] && { sleep 10 & exec sleep 10; } ;;
   *) exit 99 ;;
 esac
 verb=$2

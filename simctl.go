@@ -362,20 +362,40 @@ func readDisabled(ctx context.Context, set, udid string) (map[string]bool, error
 // launchdRetryDelays are the pauses between attempts to read a simulator's
 // launchd state. Right after a boot, and while a reboot tears the old boot
 // session down, launchd_sim refuses spawns for a few seconds
-// (LaunchdSimError 124, "Domain is tearing down"); a read that fails then is
-// retried rather than failing the whole command. A var so tests can shorten it.
+// (LaunchdSimError 124, "Domain is tearing down"); a read that fails that way
+// is retried rather than failing the whole command. A var so tests can shorten
+// it.
 var launchdRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
 
-// readLaunchd runs a read-only launchctl command inside the simulator,
-// retrying a failure after each of launchdRetryDelays.
+// spawnWaitDelay bounds how long a killed `simctl spawn` may keep its output
+// pipe open. When a spawn times out only xcrun is killed; the simctl child it
+// started still holds the pipe, and without this bound reading the output
+// would never return. A var so tests can shorten it.
+var spawnWaitDelay = 5 * time.Second
+
+// launchctlCmd builds a `simctl spawn <udid> launchctl ...` command whose
+// output is abandoned spawnWaitDelay after ctx ends.
+func launchctlCmd(ctx context.Context, set, udid string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "xcrun", simctlArgs(set, append([]string{"spawn", udid, "launchctl"}, args...)...)...)
+	cmd.WaitDelay = spawnWaitDelay
+	return cmd
+}
+
+// readLaunchd runs a read-only launchctl command inside the simulator, each
+// attempt bounded by SpawnTimeout. Only launchd_sim's transient error 124 is
+// retried, after each of launchdRetryDelays; any other failure is returned at
+// once.
 func readLaunchd(ctx context.Context, set, udid string, args ...string) ([]byte, error) {
 	for attempt := 0; ; attempt++ {
-		out, err := exec.CommandContext(ctx, "xcrun", simctlArgs(set, append([]string{"spawn", udid, "launchctl"}, args...)...)...).CombinedOutput()
+		spawnCtx, cancel := context.WithTimeout(ctx, SpawnTimeout)
+		out, err := launchctlCmd(spawnCtx, set, udid, args...).CombinedOutput()
+		cancel()
 		if err == nil {
 			return out, nil
 		}
+		settling := launchdSettling(err, out)
 		err = fmt.Errorf("launchctl %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
-		if attempt == len(launchdRetryDelays) || ctx.Err() != nil {
+		if !settling || attempt == len(launchdRetryDelays) || ctx.Err() != nil {
 			return nil, err
 		}
 		select {
@@ -384,6 +404,16 @@ func readLaunchd(ctx context.Context, set, udid string, args ...string) ([]byte,
 		case <-time.After(launchdRetryDelays[attempt]):
 		}
 	}
+}
+
+// launchdSettling reports whether a spawn failed with launchd_sim's error 124,
+// which it answers while a boot session starts or tears down.
+func launchdSettling(err error, out []byte) bool {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 124 {
+		return true
+	}
+	return strings.Contains(string(out), "code=124") || strings.Contains(string(out), "Domain is tearing down")
 }
 
 // parseDisabled reads `launchctl print-disabled` lines. Recent launchd prints
@@ -464,8 +494,7 @@ func applyDelta(ctx context.Context, set, udid string, toDisable, toEnable []str
 	launchctl := func(verb, label string) ([]byte, error) {
 		spawnCtx, cancel := context.WithTimeout(ctx, SpawnTimeout)
 		defer cancel()
-		return exec.CommandContext(spawnCtx, "xcrun", simctlArgs(set, "spawn", udid,
-			"launchctl", verb, "system/"+label)...).CombinedOutput()
+		return launchctlCmd(spawnCtx, set, udid, verb, "system/"+label).CombinedOutput()
 	}
 	run := func(action, label string) error {
 		verb := action

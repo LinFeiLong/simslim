@@ -297,10 +297,12 @@ of them; any daemon still disabled then gets its own `launchctl enable`, and any
 still not loaded its own `launchctl bootstrap`. Everything is read back. A
 daemon launchd re-enables but will not load mid-session (iOS 27's
 `cloudsettingssyncagent`, for one) starts at the next boot, and the command
-says so. `disable` stops what you name the way `on --no-reboot` does, whatever
-the profile says, except a daemon the platform needs and a daemon shared with
-another category that is fully enabled right now: `disable store` leaves the
-AMS daemons running while iCloud is on. Both list what stayed on.
+says so and lists it (`notStarted` in `--json`). `disable` stops what you name
+the way `on --no-reboot` does, whatever the profile says, except a daemon the
+platform needs and, for a category, a daemon shared with another category that
+is fully enabled right now: `disable store` leaves the AMS daemons running while
+iCloud is on. A daemon you name on its own is always stopped. `disable` lists
+what it kept running (`stillEnabled` in `--json`).
 
 Like `on --no-reboot`, both act on the running boot session only and keep no
 state: the profile stays the one description of a slim simulator, so the next

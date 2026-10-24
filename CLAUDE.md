@@ -117,15 +117,20 @@ simulator. `startServices` runs one `launchctl load -w` per chunk via
 `loadJobs`, then per-label `enable` and `bootstrapJobs` for what is left;
 `stopServices` is the unload/disable/bootout path `on --no-reboot` uses.
 Everything is read back; a label that loads only at the next boot is reported in
-`notStarted`, not as an error. `disable` keeps a label shared with another
-category whose labels are all enabled right now (`enabledNeighbours`), and
-reports it in `stillEnabled`. A simulator that is not booted is an error unless
-`--save` is given. `profile_save.go`'s `SaveServices` (`--save <file>`) adds or
+`notStarted`, not as an error. `disable` keeps a label a named category shares
+with another category whose labels are all enabled right now
+(`enabledNeighbours`), and reports it in `stillEnabled`; a label named on its
+own is always stopped. A simulator that is not booted is an error unless
+`--save` is given. `--save` validates the file first and writes it only after
+the live change succeeded. `profile_save.go`'s `SaveServices` (`--save <file>`) adds or
 removes categories in a profile file's `except` and labels in its `keep`,
 keeping order and other fields, skipping duplicates, starting a missing file
 from the default (empty) profile, and writing atomically. Launchd reads
-(`readLaunchd`) and later `applyDelta` passes pause on `launchdRetryDelays`,
-because launchd_sim answers error 124 for a few seconds around a boot or reboot.
+(`readLaunchd`) retry only launchd_sim's error 124 ("Domain is tearing down",
+answered for a few seconds around a boot or reboot) on `launchdRetryDelays`, and
+later `applyDelta` passes pause on the same delays. Reads and per-label
+transitions go through `launchctlCmd`, whose `WaitDelay` abandons the output
+pipe a killed xcrun's simctl child would otherwise hold open forever.
 
 **simctl wrapper.** `simctl.go` is the only place that shells out to
 `xcrun simctl` (list/boot/shutdown/clone/erase/delete/spawn). `measure.go` sums

@@ -138,3 +138,17 @@ func TestSaveServicesRejectsAnInvalidProfile(t *testing.T) {
 		assertProfileFile(t, path, contents)
 	}
 }
+
+// An empty profile file is refused with an error that says so, not "EOF".
+func TestEmptyProfileIsExplained(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.json")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadSlimProfile(path); err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Errorf("LoadSlimProfile of an empty file = %v, want an is-empty error", err)
+	}
+	if err := SaveServices(path, []string{"siri"}, nil, true); err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Errorf("SaveServices on an empty file = %v, want an is-empty error", err)
+	}
+}

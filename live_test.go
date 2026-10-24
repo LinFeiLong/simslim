@@ -70,6 +70,9 @@ func (f batchFake) assertEnabled(t *testing.T, labels []string, loaded ...string
 // assertNoSpawn fails if a command did more than look the simulator up.
 func (f batchFake) assertNoSpawn(t *testing.T, what string) {
 	t.Helper()
+	if _, err := os.Stat(f.log); os.IsNotExist(err) {
+		return // not even a lookup
+	}
 	for _, call := range xcrunCalls(t, f.log) {
 		if call != "simctl list devices -j" {
 			t.Errorf("%s ran %q", what, call)
@@ -304,5 +307,103 @@ func TestEnableServicesWaitsForLaunchdToSettle(t *testing.T) {
 	_, err := EnableServices(context.Background(), f.udid, []string{"media"}, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "tearing down") {
 		t.Errorf("EnableServices with launchd never ready = %v, want the 124 error", err)
+	}
+}
+
+// A daemon named on its own is stopped even while every category that lists
+// it is fully enabled: only a named category's daemons are kept for a neighbour.
+func TestDisableServicesStopsANamedDaemon(t *testing.T) {
+	useTestCategories(t)
+	labels := sortedLabels(SlimmableSet())
+	f := newBatchFake(t, "iOS-26-5", labels, "")
+
+	for _, label := range []string{"com.apple.mediad", "com.apple.shared"} {
+		out, err := DisableServices(context.Background(), f.udid, []string{label}, "", nil)
+		if err != nil {
+			t.Fatalf("DisableServices %s: %v", label, err)
+		}
+		if !reflect.DeepEqual(out.Labels, []string{label}) || len(out.StillEnabled) != 0 {
+			t.Errorf("DisableServices %s = %+v, want it stopped and nothing kept", label, out)
+		}
+		f.assertStopped(t, []string{label})
+	}
+	f.assertEnabled(t, []string{"com.apple.cloudd"}, "com.apple.cloudd")
+}
+
+// With --save, a live change that fails leaves the profile file untouched and
+// says so.
+func TestServicesSaveOnlyAfterTheLiveChange(t *testing.T) {
+	useTestCategories(t)
+	delays := launchdRetryDelays
+	launchdRetryDelays = []time.Duration{time.Millisecond}
+	t.Cleanup(func() { launchdRetryDelays = delays })
+	labels := sortedLabels(SlimmableSet())
+	f := newBatchFake(t, "iOS-26-5", labels, "")
+	f.slimmed(t, labels...)
+	if err := os.WriteFile(f.teardown, []byte("1000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ci.json")
+
+	out, err := EnableServices(context.Background(), f.udid, []string{"media"}, path, nil)
+	if err == nil || !strings.Contains(err.Error(), "not changed") {
+		t.Errorf("EnableServices --save with a failing simulator = %v, want an error saying the profile was not changed", err)
+	}
+	if out.Saved != "" {
+		t.Errorf("EnableServices --save reported %q saved after a failure", out.Saved)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("profile written after a failed live change: %v", err)
+	}
+	_, err = DisableServices(context.Background(), f.udid, []string{"media"}, path, nil)
+	if err == nil || !strings.Contains(err.Error(), "not changed") {
+		t.Errorf("DisableServices --save with a failing simulator = %v, want an error saying the profile was not changed", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("profile written after a failed live change: %v", err)
+	}
+}
+
+// Only launchd_sim's error 124 is retried; any other failure of a read is
+// returned at once, as before.
+func TestReadLaunchdRetriesOnlyTheTransientError(t *testing.T) {
+	f := newBatchFake(t, "iOS-26-5", nil, "")
+	t.Setenv("FAKE_SPAWN_ERROR", "1")
+	_, err := readDisabled(context.Background(), "default", f.udid)
+	if err == nil || !strings.Contains(err.Error(), "Invalid device state") {
+		t.Fatalf("readDisabled = %v, want the spawn error", err)
+	}
+	if calls := xcrunCalls(t, f.log); len(calls) != 1 {
+		t.Errorf("readDisabled spawned %d times on a non-transient error, want once: %v", len(calls), calls)
+	}
+}
+
+// A spawn that times out while a child process still holds its output pipe
+// returns instead of waiting for that child forever, both for a read and for
+// a per-label transition.
+func TestLaunchdSpawnsDoNotHangOnAHeldPipe(t *testing.T) {
+	f := newBatchFake(t, "iOS-26-5", []string{"com.apple.cloudd"}, "")
+	t.Setenv("FAKE_HANG", "1")
+	savedTimeout, savedWait, savedDelays := SpawnTimeout, spawnWaitDelay, launchdRetryDelays
+	SpawnTimeout, spawnWaitDelay, launchdRetryDelays = 200*time.Millisecond, 100*time.Millisecond, []time.Duration{time.Millisecond}
+	t.Cleanup(func() { SpawnTimeout, spawnWaitDelay, launchdRetryDelays = savedTimeout, savedWait, savedDelays })
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := readDisabled(context.Background(), "default", f.udid)
+		done <- err
+	}()
+	go func() {
+		done <- applyDelta(context.Background(), "default", f.udid, []string{"com.apple.cloudd"}, nil, liveDisable, nil)
+	}()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Error("a hung spawn succeeded, want a timeout error")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a hung spawn never returned")
+		}
 	}
 }

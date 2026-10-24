@@ -13,9 +13,9 @@ import (
 // each disable override is lifted and each job loaded into the running boot
 // session. It keeps no state of its own, like `on --no-reboot`: the next `on`
 // or `watch` pass applies its profile again. With save, the change is also
-// written to that profile file (see SaveServices), which is how it persists; a
-// simulator that is not booted then only gets the file, and without save it is
-// an error.
+// written to that profile file (see SaveServices), which is how it persists:
+// on a booted simulator only once the live change succeeded; a simulator that
+// is not booted only gets the file, and without save it is an error.
 func EnableServices(ctx context.Context, udid string, ids []string, save string, report Reporter) (ServicesOutput, error) {
 	categories, labels, err := resolveServiceIDs(ids)
 	if err != nil {
@@ -24,34 +24,32 @@ func EnableServices(ctx context.Context, udid string, ids []string, save string,
 	if len(categories)+len(labels) == 0 {
 		return ServicesOutput{}, fmt.Errorf("name at least one category ID or managed daemon to enable (see `simslim profiles`)")
 	}
+	if err := checkSave(save, categories, labels, true); err != nil {
+		return ServicesOutput{}, err
+	}
 	d, err := serviceTarget(ctx, udid, save)
 	if err != nil {
 		return ServicesOutput{}, err
 	}
 	out := ServicesOutput{Action: "enable", UDID: d.UDID, Live: d.State == "Booted", Labels: []string{}}
-	if save != "" {
-		if err := SaveServices(save, categories, labels, true); err != nil {
-			return out, err
+	if out.Live {
+		out.Labels = sortedKeys(coveredLabels(categories, labels))
+		report.report(fmt.Sprintf("Starting %d background services without a reboot...", len(out.Labels)))
+		if out.NotStarted, err = startServices(ctx, d, out.Labels, report); err != nil {
+			return out, unsaved(err, save)
 		}
-		out.Saved = save
 	}
-	if !out.Live {
-		return out, nil
-	}
-	out.Labels = sortedKeys(coveredLabels(categories, labels))
-	report.report(fmt.Sprintf("Starting %d background services without a reboot...", len(out.Labels)))
-	out.NotStarted, err = startServices(ctx, d, out.Labels, report)
-	return out, err
+	return out, saveServices(&out, save, categories, labels, true)
 }
 
 // DisableServices is the inverse of EnableServices: it stops categories and
 // daemons on a booted simulator at once, each one booted out of the running
-// boot session with its disable override set, no reboot. It stops what it is
-// told whatever the profile says, with two exceptions: a daemon the platform
-// needs, and a daemon shared with another category that is fully enabled right
-// now (iCloud and the store share the AMS daemons), stay enabled and are
+// boot session with its disable override set, no reboot. A daemon named on its
+// own is always stopped, unless the platform needs it. A daemon a named
+// category covers is also kept while another category that lists it is fully
+// enabled right now (iCloud and the store share the AMS daemons). Both are
 // reported in StillEnabled. With save, the categories and daemons are also
-// removed from that profile file.
+// removed from that profile file, once the live change succeeded.
 func DisableServices(ctx context.Context, udid string, ids []string, save string, report Reporter) (ServicesOutput, error) {
 	categories, labels, err := resolveServiceIDs(ids)
 	if err != nil {
@@ -66,27 +64,33 @@ func DisableServices(ctx context.Context, udid string, ids []string, save string
 			return ServicesOutput{}, fmt.Errorf("%s is never disabled: simslim keeps it running for compatibility (see `simslim profiles`)", l)
 		}
 	}
+	if err := checkSave(save, categories, labels, false); err != nil {
+		return ServicesOutput{}, err
+	}
 	d, err := serviceTarget(ctx, udid, save)
 	if err != nil {
 		return ServicesOutput{}, err
 	}
 	out := ServicesOutput{Action: "disable", UDID: d.UDID, Live: d.State == "Booted", Labels: []string{}}
-	if save != "" {
-		if err := SaveServices(save, categories, labels, false); err != nil {
-			return out, err
+	if out.Live {
+		if err := stopNamed(ctx, d, &out, categories, labels, report); err != nil {
+			return out, unsaved(err, save)
 		}
-		out.Saved = save
 	}
-	if !out.Live {
-		return out, nil
-	}
+	return out, saveServices(&out, save, categories, labels, false)
+}
+
+// stopNamed stops what DisableServices was told to on a booted simulator,
+// filling out.Labels with what it stops and out.StillEnabled with what it keeps.
+func stopNamed(ctx context.Context, d Device, out *ServicesOutput, categories, labels []string, report Reporter) error {
 	disabled, err := readDisabled(ctx, d.Set, d.UDID)
 	if err != nil {
-		return out, err
+		return err
 	}
+	slimmable := SlimmableSet()
 	covered := coveredLabels(categories, labels)
 	allowed := desiredForDevice(d, covered)
-	kept := enabledNeighbours(covered, categories, disabled)
+	kept := enabledNeighbours(categories, labels, disabled)
 	for _, l := range sortedKeys(covered) {
 		if allowed[l] && slimmable[l] && !kept[l] {
 			out.Labels = append(out.Labels, l)
@@ -95,17 +99,23 @@ func DisableServices(ctx context.Context, udid string, ids []string, save string
 		}
 	}
 	if len(out.Labels) == 0 {
-		return out, nil
+		return nil
 	}
 	report.report(fmt.Sprintf("Stopping %d background services without a reboot...", len(out.Labels)))
-	return out, stopServices(ctx, d, out.Labels, report)
+	return stopServices(ctx, d, out.Labels, report)
 }
 
-// enabledNeighbours returns the labels in covered that another category, one
-// not being disabled and with every label enabled right now, also lists. Only
-// the live state says which features are on, so that is what decides: stopping
-// the store keeps the AMS daemons iCloud shares while iCloud is fully running.
-func enabledNeighbours(covered map[string]bool, disabling []string, disabled map[string]bool) map[string]bool {
+// enabledNeighbours returns the labels the disabling categories cover that
+// another category, one not being disabled and with every label enabled right
+// now, also lists. Only the live state says which features are on, so that is
+// what decides: stopping the store keeps the AMS daemons iCloud shares while
+// iCloud is fully running. A label named on its own is never kept: naming it
+// is asking for exactly that daemon to stop.
+func enabledNeighbours(disabling, named []string, disabled map[string]bool) map[string]bool {
+	covered := coveredLabels(disabling, nil)
+	for _, l := range named {
+		delete(covered, l)
+	}
 	kept := map[string]bool{}
 	for _, c := range Categories {
 		if slices.Contains(disabling, c.ID) {
@@ -126,6 +136,40 @@ func enabledNeighbours(covered map[string]bool, disabling []string, disabled map
 		}
 	}
 	return kept
+}
+
+// checkSave validates the profile file --save names before anything changes,
+// so a bad file fails the command up front.
+func checkSave(save string, categories, labels []string, enable bool) error {
+	if save == "" {
+		return nil
+	}
+	_, _, err := updatedProfile(save, categories, labels, enable)
+	return err
+}
+
+// saveServices writes the change to the profile file --save names, if any,
+// once the simulator has been changed.
+func saveServices(out *ServicesOutput, save string, categories, labels []string, enable bool) error {
+	if save == "" {
+		return nil
+	}
+	if err := SaveServices(save, categories, labels, enable); err != nil {
+		if out.Live {
+			return fmt.Errorf("the simulator was changed, but profile %s was not: %w", save, err)
+		}
+		return err
+	}
+	out.Saved = save
+	return nil
+}
+
+// unsaved notes on a failed live change that --save left the profile alone.
+func unsaved(err error, save string) error {
+	if save == "" {
+		return err
+	}
+	return fmt.Errorf("%w (profile %s not changed)", err, save)
 }
 
 // serviceTarget resolves the exact simulator `enable` and `disable` act on, so

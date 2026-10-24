@@ -20,9 +20,19 @@ import (
 // profile, the one `on` applies without --profile. An unchanged profile is not
 // rewritten; a changed one is replaced atomically.
 func SaveServices(path string, categories, labels []string, enable bool) error {
+	data, changed, err := updatedProfile(path, categories, labels, enable)
+	if err != nil || !changed {
+		return err
+	}
+	return writeFileAtomic(path, data)
+}
+
+// updatedProfile reads the profile at path and returns it with the change
+// applied, and whether that changed anything. It writes nothing.
+func updatedProfile(path string, categories, labels []string, enable bool) (data []byte, changed bool, err error) {
 	sp, exists, err := readSlimProfile(path)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	before := slices.Clone(sp.Except)
 	beforeKeep := slices.Clone(sp.Keep)
@@ -46,19 +56,19 @@ func SaveServices(path string, categories, labels []string, enable bool) error {
 		for _, l := range labels {
 			for _, id := range sp.Except {
 				if coveredLabels([]string{id}, nil)[l] {
-					return fmt.Errorf("profile %s keeps %s enabled through category %q; disable that category instead, or edit the file", path, l, id)
+					return nil, false, fmt.Errorf("profile %s keeps %s enabled through category %q; disable that category instead, or edit the file", path, l, id)
 				}
 			}
 		}
 	}
 	if exists && slices.Equal(before, sp.Except) && slices.Equal(beforeKeep, sp.Keep) {
-		return nil
+		return nil, false, nil
 	}
-	data, err := MarshalProfile(sp)
+	data, err = MarshalProfile(sp)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	return writeFileAtomic(path, data)
+	return data, true, nil
 }
 
 // readSlimProfile reads and validates a profile file, keeping its entries as
@@ -74,7 +84,7 @@ func readSlimProfile(path string) (sp SlimProfile, exists bool, err error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&sp); err != nil {
-		return SlimProfile{}, false, fmt.Errorf("parse profile %s: %w", path, err)
+		return SlimProfile{}, false, parseProfileError(path, err)
 	}
 	if _, err := sp.resolve(path); err != nil {
 		return SlimProfile{}, false, err
@@ -99,6 +109,10 @@ func writeFileAtomic(path string, data []byte) error {
 	}
 	defer os.Remove(temp.Name())
 	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return fmt.Errorf("write profile %s: %w", path, err)
+	}
+	if err := temp.Sync(); err != nil {
 		temp.Close()
 		return fmt.Errorf("write profile %s: %w", path, err)
 	}
